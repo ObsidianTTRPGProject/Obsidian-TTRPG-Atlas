@@ -140,6 +140,29 @@ python3 fr_to_obsidian.py --input /path/to/forgottenrealms_pages_current.xml --o
 
 ---
 
+### With Images — Linked from Fandom CDN
+
+Adding `--images` embeds article and infobox images directly from the Fandom CDN. No files are downloaded — images load from the web when you view a note. Use `--image-width` to cap the display width of body images (the infobox image is always uncapped — ITS Theme handles its sizing automatically).
+
+**Windows:**
+```
+python fr_to_obsidian.py --input "D:\Downloads\forgottenrealms_pages_current.xml" --output "D:\Obsidian\FR-Vault" --images --image-width 400
+```
+
+**Mac/Linux:**
+```
+python3 fr_to_obsidian.py --input dump.xml --output FR-Vault --images --image-width 400
+```
+
+Both flags work with map mode too:
+```
+python3 fr_to_obsidian.py --input dump.xml --output FR-Vault --json map.json --images --image-width 400
+```
+
+`--images` is **off by default** — omitting it produces the same output as before.
+
+---
+
 ### Map Mode — Focused on Your Campaign Region
 
 If you use the [Obsidian Leaflet](https://github.com/javalent/obsidian-leaflet) or similar map plugin and have a JSON file with map pins, you can run in map mode. The script will extract only the articles linked from your map pins, then follow all links from those place articles outward — pulling in everything geographically connected to your map while skipping unrelated content.
@@ -290,6 +313,8 @@ tags:
 
 > [!infobox|right]+
 > # Daggerford
+> ![Daggerford](https://static.wikia.nocookie.net/forgottenrealms/images/0/03/NWN.DoD_cinematic_Daggerford.png)
+>
 > ###### Details
 > | | |
 > |---|---|
@@ -308,6 +333,7 @@ tags:
 
 Note that:
 - The infobox **floats right** with article text wrapping around it (ITS Theme required)
+- When `--images` is used, the infobox image appears at the top of the callout (as shown above)
 - Wikilinks **inside** the infobox rows are preserved and clickable
 - Links like `[[Waterdeep-Dock Ward|Dock Ward]]` correctly resolve to the note on disk
 - The YAML frontmatter fields are searchable in Obsidian's search and Dataview plugin
@@ -318,7 +344,7 @@ Note that:
 
 **Content freshness** — The XML dump reflects each article as of its last edit. Articles updated on the live Fandom wiki after the dump date will show older content. This is a limitation of the dump-based approach and cannot be worked around in the script.
 
-**Images** — The XML dump does not include image files. Infobox image fields are extracted to frontmatter for reference but images are not embedded in notes.
+**Images** — Images are not included by default. Use `--images` to embed them from the Fandom CDN (requires an internet connection when viewing notes). Use `--image-width N` to cap the display width of body images in pixels — the infobox image is always uncapped. Images load from the web on demand; nothing is downloaded to disk.
 
 **Very short articles** — Stub articles with almost no content after template removal are skipped to avoid creating empty notes. These represent a small fraction of the wiki.
 
@@ -368,8 +394,8 @@ Yes — any JSON file in Obsidian Leaflet marker format with `"link"` fields con
 **Will this work with future XML dumps?**
 Yes. The FR Wiki releases updated XML dumps periodically. You can re-run the script against a newer dump to get updated notes. Delete the old output folder first.
 
-**Does it download images?**
-No. The XML dump doesn't contain images. The notes work fully without them.
+**Does it embed images?**
+Not by default. Use `--images` to link images from the Fandom CDN. They load from the web when you view a note — nothing is downloaded to disk. Use `--image-width 400` (or any pixel value) to cap the display width of body images.
 
 **Is this legal?**
 The FR Wiki text is licensed under CC BY-SA 3.0 which permits this use provided attribution is given — the script adds attribution automatically to every note's frontmatter. See the Licensing section below.
@@ -415,7 +441,6 @@ Found a bug? Have an improvement? Pull requests are welcome. Some areas that cou
 
 - Better category detection for edge cases
 - Support for additional infobox types
-- Image downloading support
 - Support for other Fandom/MediaWiki wikis
 - GUI wrapper for non-technical users
 
