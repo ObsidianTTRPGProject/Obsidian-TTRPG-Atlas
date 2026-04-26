@@ -5,11 +5,24 @@ Forgotten Realms Wiki XML -> Obsidian Vault Converter
 Converts the FR Wiki XML dump into individual Obsidian .md notes with:
   - YAML frontmatter (including infobox fields for places)
   - [[wikilinks]] preserved and redirects resolved
+  - Broken links converted to plain text automatically
   - Subfolders by category
-  - Place infobox data extracted so no content is lost
+  - Place infobox data extracted to ITS Theme callout boxes
+  - Optional: inline images linked from Fandom CDN  (--images)
+  - Optional: image width cap for large images        (--image-width N)
 
 Usage:
-    python fr_to_obsidian.py --input forgottenrealms_pages_current.xml --output FR-Vault
+    # Full vault, no images
+    python fr_to_obsidian.py --input dump.xml --output FR-Vault
+
+    # Map-focused vault (Sword Coast etc.)
+    python fr_to_obsidian.py --input dump.xml --output FR-Vault --json map.json
+
+    # Full vault with images
+    python fr_to_obsidian.py --input dump.xml --output FR-Vault --images
+
+    # Map-focused vault with images capped at 400 px wide
+    python fr_to_obsidian.py --input dump.xml --output FR-Vault --json map.json --images --image-width 400
 
 Requirements:
     python -m pip install tqdm   (optional, for progress bar)
@@ -17,6 +30,8 @@ Requirements:
 
 import re
 import json
+import hashlib
+import html
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -49,12 +64,11 @@ PLACE_INFOBOX_NAMES = {
 }
 
 # ALL infobox types to strip from wikitext before markdown conversion
-# (prevents raw infobox markup leaking into note body)
 ALL_INFOBOX_NAMES = PLACE_INFOBOX_NAMES | {
     'person', 'creature', 'item', 'spell', 'organization', 'deity',
     'class', 'race', 'book', 'bookiu', 'computer game', 'video game',
     'boardgame', 'sourcebook', 'adventure', 'novel', 'comic',
-    'magic item', 'weapon', 'armor', 'vehicle', 'ship', 'deity',
+    'magic item', 'weapon', 'armor', 'vehicle', 'ship',
     'disease', 'poison', 'trap', 'event', 'war', 'battle',
     'language', 'calendar', 'currency', 'food', 'drink',
     'roll of years', 'members', 'member', 'archivebox',
@@ -65,6 +79,19 @@ ALL_INFOBOX_NAMES = PLACE_INFOBOX_NAMES | {
     'information', 'category jump', 'religion category jump',
     'creature category jump', 'forum post', 'refonly',
 }
+
+# Meta/navigation templates skipped when searching for the real content infobox
+META_TEMPLATES = {
+    'otheruses4', 'otheruses', 'for', 'main', 'see also', 'redirect',
+    'ga', 'stub', 'cleanup', 'delete', 'merge', 'disambig',
+    'tl', 'signature', 'archivebox', 'refonly', 'forum post',
+    'cite book', 'cite web', 'cite dragon', 'cite organized play', 'cite game',
+    'information', 'category jump', 'religion category jump',
+    'creature category jump', 'roll of years', 'members', 'member',
+}
+
+# Content infobox types (everything except pure nav/meta)
+CONTENT_INFOBOX_NAMES = ALL_INFOBOX_NAMES - META_TEMPLATES
 
 # Infobox fields to pull into frontmatter
 PLACE_FIELDS = {
@@ -130,7 +157,179 @@ CATEGORY_RULES = [
 ]
 
 FALLBACK_FOLDER = 'Miscellaneous'
-BASE_URL = 'https://forgottenrealms.fandom.com/wiki/'
+BASE_URL  = 'https://forgottenrealms.fandom.com/wiki/'
+WIKI_ID   = 'forgottenrealms'
+
+
+# ---------------------------------------------------------------------------
+# Image helpers  (only used when --images is passed)
+# ---------------------------------------------------------------------------
+
+def mediawiki_image_url(filename: str) -> str:
+    """Return the Fandom CDN URL for a MediaWiki image file."""
+    name = filename.strip().replace(' ', '_')
+    if name:
+        name = name[0].upper() + name[1:]
+    digest = hashlib.md5(name.encode('utf-8')).hexdigest()
+    a, ab = digest[0], digest[:2]
+    return f'https://static.wikia.nocookie.net/{WIKI_ID}/images/{a}/{ab}/{name}'
+
+
+_IMAGE_PARAM_RE = re.compile(
+    r'^(thumb|thumbnail|frame|frameless|border|left|right|center|none'
+    r'|\d+px|upright[\d.=]*)$',
+    re.IGNORECASE,
+)
+
+
+def _clean_image_caption(raw: str) -> str:
+    raw = re.sub(r'\[\[[^\]]*\|([^\]]*)\]\]', r'\1', raw)
+    raw = re.sub(r'\[\[([^\]]*)\]\]', r'\1', raw)
+    raw = re.sub(r"'{2,5}", '', raw)
+    return raw.strip()
+
+
+def _make_image_md(raw_name: str, caption: str, image_width: int) -> str:
+    """Build Markdown image syntax, optionally capping width.
+
+    Obsidian supports  ![alt|NNNpx](url)  to set a display width.
+    """
+    url = mediawiki_image_url(raw_name)
+    if image_width:
+        return f'![{caption}|{image_width}]({url})'
+    return f'![{caption}]({url})'
+
+
+def _process_inline_images(wikitext: str, image_width: int) -> str:
+    """Replace [[File:…]] / [[Image:…]] wikilinks with Markdown images.
+
+    Uses bracket-depth counting so captions containing [[wikilinks]]
+    are handled correctly.
+    """
+    file_start = re.compile(r'\[\[(?:File|Image|Media):', re.IGNORECASE)
+    out = []
+    i = 0
+    while i < len(wikitext):
+        m = file_start.search(wikitext, i)
+        if not m:
+            out.append(wikitext[i:])
+            break
+        out.append(wikitext[i:m.start()])
+        depth = 0
+        j = m.start()
+        while j < len(wikitext):
+            if wikitext[j:j+2] == '[[':
+                depth += 1
+                j += 2
+            elif wikitext[j:j+2] == ']]':
+                depth -= 1
+                if depth == 0:
+                    j += 2
+                    break
+                j += 2
+            else:
+                j += 1
+        full_link = wikitext[m.start():j]
+        inner     = full_link[2:-2]
+        parts     = inner.split('|')
+        raw_name  = parts[0].split(':', 1)[-1].strip()
+        caption   = ''
+        for part in parts[1:]:
+            part = part.strip()
+            if not _IMAGE_PARAM_RE.match(part) and part:
+                caption = part
+        caption = _clean_image_caption(caption)
+        out.append(_make_image_md(raw_name, caption, image_width))
+        i = j
+    return ''.join(out)
+
+
+def _process_gallery_block(gallery_body: str, image_width: int) -> str:
+    """Convert a <gallery> block body into a Markdown ## Gallery section."""
+    images = []
+    for line in gallery_body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if '|' in line:
+            raw_name, raw_caption = line.split('|', 1)
+        else:
+            raw_name, raw_caption = line, ''
+        raw_name = raw_name.strip()
+        if not raw_name:
+            continue
+        caption = _clean_image_caption(raw_caption)
+        images.append(_make_image_md(raw_name, caption, image_width))
+    if not images:
+        return ''
+    return '## Gallery\n\n' + '\n\n'.join(images)
+
+
+# ---------------------------------------------------------------------------
+# Quote template conversion
+# ---------------------------------------------------------------------------
+
+def _convert_quote_templates(wikitext: str) -> str:
+    """Replace {{quote|text|attribution}} with a Markdown blockquote."""
+    quote_start = re.compile(r'\{\{[Qq]uote\s*\|')
+    out = []
+    i = 0
+    while i < len(wikitext):
+        m = quote_start.search(wikitext, i)
+        if not m:
+            out.append(wikitext[i:])
+            break
+        out.append(wikitext[i:m.start()])
+        depth = 0
+        j = m.start()
+        while j < len(wikitext):
+            if wikitext[j:j+2] == '{{':
+                depth += 1
+                j += 2
+            elif wikitext[j:j+2] == '}}':
+                depth -= 1
+                if depth == 0:
+                    j += 2
+                    break
+                j += 2
+            else:
+                j += 1
+        full  = wikitext[m.start():j]
+        inner = full[2:-2]
+        parts = []
+        cur   = []
+        d     = 0
+        start_idx = inner.index('|') + 1
+        for ch_i in range(start_idx, len(inner)):
+            ch = inner[ch_i]
+            if inner[ch_i:ch_i+2] == '{{':
+                d += 1
+                cur.append(ch)
+            elif inner[ch_i:ch_i+2] == '}}':
+                d -= 1
+                cur.append(ch)
+            elif ch == '|' and d == 0:
+                parts.append(''.join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append(''.join(cur).strip())
+        body        = parts[0] if parts else ''
+        attribution = parts[1] if len(parts) > 1 else ''
+        for _ in range(4):
+            body        = re.sub(r'\{\{[^{}]*\}\}', '', body)
+            attribution = re.sub(r'\{\{[^{}]*\}\}', '', attribution)
+        body        = body.strip()
+        attribution = attribution.strip()
+        if body:
+            bq_lines = '\n'.join(f'> {ln}' if ln.strip() else '>' for ln in body.splitlines())
+            if attribution:
+                out.append(f'{bq_lines}\n>\n> \u2014 {attribution}\n')
+            else:
+                out.append(f'{bq_lines}\n')
+        i = j
+    return ''.join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +337,6 @@ BASE_URL = 'https://forgottenrealms.fandom.com/wiki/'
 # ---------------------------------------------------------------------------
 
 def clean_field_value(val: str) -> str:
-    """Strip refs, nested templates, HTML from an infobox value."""
     val = re.sub(r'<ref[^>]*/>', '', val)
     val = re.sub(r'<ref[^>]*>.*?</ref>', '', val, flags=re.DOTALL)
     val = re.sub(r'<br\s*/?>', ', ', val, flags=re.IGNORECASE)
@@ -149,40 +347,16 @@ def clean_field_value(val: str) -> str:
     return val.strip()
 
 
-# Templates that are navigation/meta and should be skipped when
-# looking for the real content infobox
-META_TEMPLATES = {
-    'otheruses4', 'otheruses', 'for', 'main', 'see also', 'redirect',
-    'ga', 'stub', 'cleanup', 'delete', 'merge', 'disambig',
-    'tl', 'signature', 'archivebox', 'refonly', 'forum post',
-    'cite book', 'cite web', 'cite dragon', 'cite organized play', 'cite game',
-    'information', 'category jump', 'religion category jump',
-    'creature category jump', 'roll of years', 'members', 'member',
-}
-
-# Content infobox types (place + character + other content)
-CONTENT_INFOBOX_NAMES = ALL_INFOBOX_NAMES - META_TEMPLATES
-
-
 def extract_infobox(wikitext: str) -> tuple:
-    """
-    Extract the first recognised content infobox, skipping meta/navigation templates.
-    Returns (infobox_type_str, dict_of_fields) or (None, {}).
-    Uses depth-counting to handle nested braces correctly.
-    """
+    """Extract the first recognised content infobox, skipping meta templates."""
     pattern = r'\{\{(' + '|'.join(re.escape(n) for n in CONTENT_INFOBOX_NAMES) + r')\s*[\n\r|]'
     m = re.search(pattern, wikitext, re.IGNORECASE)
     if not m:
         return None, {}
-
     infobox_type = m.group(1).strip().lower()
-    # For non-place infoboxes, just return the type — no field extraction needed
     if infobox_type not in PLACE_INFOBOX_NAMES:
         return infobox_type, {}
-
     start = m.end()
-
-    # Walk to find the matching }}
     depth = 1
     i = start
     while i < len(wikitext) and depth > 0:
@@ -196,24 +370,19 @@ def extract_infobox(wikitext: str) -> tuple:
             i += 2
         else:
             i += 1
-
     infobox_body = wikitext[start:i]
-
-    # Parse | key = value pairs
     fields = {}
-    field_pattern = re.compile(r'^\|\s*([^=|\n]+?)\s*=[ \t]*(.*)$', re.MULTILINE)
-    for fm in field_pattern.finditer(infobox_body):
+    # Match fields with or without leading pipe (first field after {{Template\n has no pipe)
+    for fm in re.compile(r'^\|?\s*([^=|\n]+?)\s*=[ \t]*(.*)$', re.MULTILINE).finditer(infobox_body):
         key = fm.group(1).strip().lower().replace(' ', '_')
         val = clean_field_value(fm.group(2))
-        if val and val not in ('-', 'N/A', 'n/a', ''):
-            if key not in fields:  # first value wins
-                fields[key] = val
-
+        if val and val not in ('-', 'N/A', 'n/a', '') and key not in fields:
+            fields[key] = val
     return infobox_type, fields
 
 
 def strip_place_infoboxes(wikitext: str) -> str:
-    """Remove place infobox blocks from wikitext (we already extracted the data)."""
+    """Remove all infobox blocks from wikitext (data already extracted)."""
     pattern = r'\{\{(' + '|'.join(re.escape(n) for n in ALL_INFOBOX_NAMES) + r')\s*[\n\r|]'
     result = wikitext
     while True:
@@ -244,25 +413,66 @@ def strip_place_infoboxes(wikitext: str) -> str:
 # ---------------------------------------------------------------------------
 
 def normalise_title(title: str) -> str:
-    """Normalise for redirect lookup."""
     title = unquote(title)
     title = title.replace('_', ' ')
     title = title.split('#')[0]
     return title.strip().lower()
 
 
-def convert_wikitext_to_markdown(wikitext: str) -> str:
-    """Convert wikitext markup to Markdown, preserving [[wikilinks]]."""
+def convert_wikitext_to_markdown(wikitext: str, include_images: bool = False,
+                                  image_width: int = 0) -> str:
+    """Convert wikitext to Markdown, preserving [[wikilinks]].
 
-    # Remove <ref> tags
-    wikitext = re.sub(r'<ref[^>]*>.*?</ref>', '', wikitext, flags=re.DOTALL)
-    wikitext = re.sub(r'<ref[^/]*/>', '', wikitext)
+    Args:
+        wikitext:       Raw wikitext string.
+        include_images: If True, [[File:…]] and <gallery> blocks are converted
+                        to Markdown images linked from the Fandom CDN.
+                        If False (default) they are removed entirely.
+        image_width:    If > 0 and include_images is True, images are rendered
+                        as  ![caption|Npx](url)  to cap their display width in
+                        Obsidian.  Has no effect when include_images is False.
+    """
+    # Self-closing refs MUST go before paired refs (ordering is critical)
+    wikitext = re.sub(r'<ref\b[^>]*/>', '', wikitext)
+    wikitext = re.sub(r'<ref\b[^>]*>.*?</ref>', '', wikitext, flags=re.DOTALL)
 
-    # Remove HTML comments
     wikitext = re.sub(r'<!--.*?-->', '', wikitext, flags=re.DOTALL)
 
+    # Ordinal-suffix templates: {{th}} -> th etc.
+    wikitext = re.sub(r'\{\{(th|st|nd|rd)\}\}', r'\1', wikitext, flags=re.IGNORECASE)
+
+    # Quote templates -> blockquotes (before general template removal)
+    wikitext = _convert_quote_templates(wikitext)
+
+    # ── Images ──────────────────────────────────────────────────────────────
+    gallery_sections: list = []
+
+    if include_images:
+        # Inline [[File:...]] -> ![caption](cdn_url)
+        # Runs before save_link so depth-counting handles captions with wikilinks
+        wikitext = _process_inline_images(wikitext, image_width)
+
+        # <gallery> blocks -> collect as ## Gallery section
+        def _collect_gallery(m):
+            md = _process_gallery_block(m.group(1), image_width)
+            if md:
+                gallery_sections.append(md)
+            return ''
+
+        wikitext = re.sub(
+            r'<gallery[^>]*>(.*?)</gallery>',
+            _collect_gallery,
+            wikitext,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    else:
+        # Remove images entirely
+        wikitext = re.sub(r'\[\[(?:File|Image|Media):[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+        wikitext = re.sub(r'<gallery[^>]*>.*?</gallery>', '', wikitext, flags=re.DOTALL | re.IGNORECASE)
+    # ────────────────────────────────────────────────────────────────────────
+
     # Save [[wikilinks]] so template removal doesn't eat them
-    links = []
+    links: list = []
 
     def save_link(m):
         links.append(m.group(0))
@@ -276,12 +486,15 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     wikitext = re.sub(r'\{\{|\}\}', '', wikitext)
 
     # Restore wikilinks
-    for i, link in enumerate(links):
-        wikitext = wikitext.replace(f'\x00LINK{i}\x00', link)
+    for idx, lnk in enumerate(links):
+        wikitext = wikitext.replace(f'\x00LINK{idx}\x00', lnk)
 
-    # Remove File/Image/Category/language links
-    wikitext = re.sub(r'\[\[(?:File|Image|Media):[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+    # Category links
     wikitext = re.sub(r'\[\[Category:[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+    wikitext = re.sub(r'\[\[:Category:(?:[^|\]]*)\|([^\]]*)\]\]', r'\1', wikitext, flags=re.IGNORECASE)
+    wikitext = re.sub(r'\[\[:Category:[^\]]*\]\]', '', wikitext, flags=re.IGNORECASE)
+
+    # Interlanguage links
     wikitext = re.sub(r'\[\[[a-z]{2,3}:[^\]]*\]\]', '', wikitext)
 
     # External links: keep display text
@@ -291,25 +504,13 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     # Remove trailing sections
     wikitext = re.sub(
         r'^(==+)\s*(References|See also|External links|Gallery|Appendix|Notes|Further reading|Appearances)\s*\1.*',
-        '', wikitext, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE
+        '', wikitext, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
 
-    # Headings
-    for lvl in range(6, 1, -1):
-        eq = '=' * lvl
-        md_hashes = '#' * (lvl - 1)
-        wikitext = re.sub(
-            rf'^{eq}\s*(.+?)\s*{eq}\s*$',
-            rf'{md_hashes} \1',
-            wikitext,
-            flags=re.MULTILINE
-        )
+    # Strip remaining HTML tags
+    wikitext = re.sub(r'<[^>]+>', '', wikitext)
 
-    # Bold and italic (using character repetition to avoid quote issues)
-    wikitext = re.sub(r"'{3}(.+?)'{3}", r'**\1**', wikitext)
-    wikitext = re.sub(r"'{2}(.+?)'{2}", r'*\1*',   wikitext)
-
-    # Lists
+    # Lists - convert BEFORE headings so * [[Link]] works cleanly
     wikitext = re.sub(r'^\*\*\*\s*', '      - ', wikitext, flags=re.MULTILINE)
     wikitext = re.sub(r'^\*\*\s*',   '   - ',    wikitext, flags=re.MULTILINE)
     wikitext = re.sub(r'^\*\s*',     '- ',       wikitext, flags=re.MULTILINE)
@@ -321,23 +522,45 @@ def convert_wikitext_to_markdown(wikitext: str) -> str:
     wikitext = re.sub(r'^;\s*(.+)', r'**\1**', wikitext, flags=re.MULTILINE)
     wikitext = re.sub(r'^:\s*',     '> ',      wikitext, flags=re.MULTILINE)
 
-    # Gallery blocks and remaining HTML
-    wikitext = re.sub(r'<gallery[^>]*>.*?</gallery>', '', wikitext, flags=re.DOTALL | re.IGNORECASE)
-    wikitext = re.sub(r'<[^>]+>', '', wikitext)
+    # Headings - deepest first so ====X==== isn't partially matched by ==
+    for lvl in range(6, 1, -1):
+        eq        = '=' * lvl
+        md_hashes = '#' * lvl
+        wikitext  = re.sub(
+            rf'^{eq}\s*(.+?)\s*{eq}\s*$',
+            rf'{md_hashes} \1',
+            wikitext,
+            flags=re.MULTILINE,
+        )
 
-    # Clean up blank lines
+    # Bold+italic, bold, italic
+    wikitext = re.sub(r"'{5}(.+?)'{5}", r'***\1***', wikitext)
+    wikitext = re.sub(r"'{3}(.+?)'{3}", r'**\1**',   wikitext)
+    wikitext = re.sub(r"'{2}(.+?)'{2}", r'*\1*',     wikitext)
+
+    # Unescape HTML entities (&amp; -> &, &nbsp; -> space etc.)
+    wikitext = html.unescape(wikitext)
+
     wikitext = re.sub(r'\n{3,}', '\n\n', wikitext)
 
-    return wikitext.strip()
+    body = wikitext.strip()
 
+    # Append gallery images collected above (images mode only)
+    if gallery_sections:
+        body = body.rstrip('\n') + '\n\n' + '\n\n'.join(gallery_sections)
+
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Link helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_link_target(page: str) -> str:
-    """
-    Sanitize a page name to match the filename on disk.
-    Replaces characters invalid in filenames (/ : * ? etc) with hyphens,
-    matching sanitize_filename() used when writing notes.
-    Critical for links like [[Waterdeep/Dock Ward]] which must become
-    [[Waterdeep-Dock Ward]] to match the file Waterdeep-Dock Ward.md.
+    """Sanitize a page name to match the filename on disk.
+
+    Replaces characters invalid in filenames (/ : * ? etc.) with hyphens.
+    Critical for links like [[Waterdeep/Dock Ward]] -> [[Waterdeep-Dock Ward]].
     """
     safe = re.sub(r'[\\/:*?"<>|]', '-', page)
     safe = re.sub(r'-+', '-', safe).strip(' -.')
@@ -349,23 +572,21 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
 
     def replace_link(m):
         inner = m.group(1).strip()
-
         if '|' in inner:
             page_part, display = inner.split('|', 1)
             display = display.strip()
         else:
             page_part = inner
-            display = None
+            display   = None
 
-        norm = normalise_title(page_part)
-        # Clean underscores/anchors for display text
+        norm       = normalise_title(page_part)
         clean_page = page_part.replace('_', ' ').split('#')[0].strip()
-        # Sanitize to match actual filename (/ -> -, etc.)
-        safe_page = sanitize_link_target(clean_page)
-        target = redirect_map.get(norm)
+        safe_page  = sanitize_link_target(clean_page)
+        target     = redirect_map.get(norm)
 
         if target:
-            # Redirect resolved — sanitize the target to match its filename
+            if re.match(r':?Category:', target, re.IGNORECASE):
+                return display or clean_page
             safe_target = sanitize_link_target(target)
             if display:
                 return f'[[{safe_target}|{display}]]'
@@ -374,7 +595,8 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
             else:
                 return f'[[{safe_target}]]'
         else:
-            # No redirect — use sanitized page name so link matches file on disk
+            if re.match(r':?Category:', clean_page, re.IGNORECASE):
+                return display or clean_page
             if display:
                 return f'[[{safe_page}|{display}]]'
             elif safe_page != page_part:
@@ -392,14 +614,11 @@ def resolve_wikilinks(text: str, redirect_map: dict) -> str:
 def detect_category(title: str, content: str,
                     infobox_type: str = None, infobox_fields: dict = None) -> tuple:
     """Return (subfolder_path, category_label)."""
-
     if infobox_type:
-        itype = infobox_type.lower()
+        itype    = infobox_type.lower()
         loc_type = (infobox_fields or {}).get('type', '').lower()
 
-        # Non-place infoboxes — route to appropriate category by infobox type
         if itype == 'person':
-            # Person infobox — use keyword matching on content for sub-category
             search_text = (title + ' ' + content[:800]).lower()
             for pattern, folder in CATEGORY_RULES:
                 if re.search(pattern, search_text, re.IGNORECASE):
@@ -415,25 +634,17 @@ def detect_category(title: str, content: str,
                     if folder.startswith('Creatures/'):
                         return folder, label
             return 'Creatures/Monsters', 'Monsters'
-        if itype == 'deity':
-            return 'Deities & Religion', 'Deities & Religion'
-        if itype == 'organization':
-            return 'Organizations', 'Organizations'
-        if itype in ('spell',):
-            return 'Magic/Spells', 'Spells'
+        if itype == 'deity':        return 'Deities & Religion', 'Deities & Religion'
+        if itype == 'organization': return 'Organizations', 'Organizations'
+        if itype == 'spell':        return 'Magic/Spells', 'Spells'
         if itype in ('item', 'magic item', 'weapon', 'armor'):
             return 'Magic/Items & Artifacts', 'Items & Artifacts'
-
-        # Place infoboxes
-        if itype == 'road':
-            return 'Places/Roads & Paths', 'Roads & Paths'
-        if itype == 'building':
-            return 'Places/Buildings', 'Buildings'
+        if itype == 'road':         return 'Places/Roads & Paths', 'Roads & Paths'
+        if itype == 'building':     return 'Places/Buildings', 'Buildings'
 
         if itype in ('location', 'settlement', 'region', 'nation',
                      'body of water', 'forest', 'mountain', 'dungeon',
                      'plane', 'island', 'sea', 'cave', 'ruins'):
-
             if any(t in loc_type for t in ('city', 'town', 'village', 'settlement', 'hamlet', 'metropolis', 'borough')):
                 return 'Places/Settlements', 'Settlements'
             if any(t in loc_type for t in ('fortress', 'castle', 'keep', 'tower', 'dungeon', 'ruins', 'stronghold', 'citadel')):
@@ -444,26 +655,17 @@ def detect_category(title: str, content: str,
                 return 'Places/Regions & Nations', 'Regions & Nations'
             if any(t in loc_type for t in ('plane', 'realm', 'dimension')):
                 return 'Places/Planes', 'Planes'
-
-            # Fallback by infobox type name
-            if itype == 'plane':
-                return 'Places/Planes', 'Planes'
-            if itype in ('forest', 'mountain', 'body of water', 'island', 'sea'):
-                return 'Places/Geography', 'Geography'
-            if itype in ('region', 'nation'):
-                return 'Places/Regions & Nations', 'Regions & Nations'
-            if itype in ('dungeon', 'cave', 'ruins'):
-                return 'Places/Fortresses & Ruins', 'Fortresses & Ruins'
-            # Default location -> Settlements
+            if itype == 'plane':                                    return 'Places/Planes', 'Planes'
+            if itype in ('forest', 'mountain', 'body of water', 'island', 'sea'): return 'Places/Geography', 'Geography'
+            if itype in ('region', 'nation'):                       return 'Places/Regions & Nations', 'Regions & Nations'
+            if itype in ('dungeon', 'cave', 'ruins'):               return 'Places/Fortresses & Ruins', 'Fortresses & Ruins'
             return 'Places/Settlements', 'Settlements'
 
-    # Keyword matching fallback
     search_text = (title + ' ' + content[:800]).lower()
     for pattern, folder in CATEGORY_RULES:
         if re.search(pattern, search_text, re.IGNORECASE):
             label = folder.split('/')[-1]
             return folder, label
-
     return FALLBACK_FOLDER, 'Miscellaneous'
 
 
@@ -478,7 +680,6 @@ def slugify_url(title: str) -> str:
 
 
 def strip_wikilinks_for_frontmatter(val: str) -> str:
-    """Convert [[Page|Display]] -> Display and [[Page]] -> Page."""
     val = re.sub(r'\[\[([^\]|]+)\|([^\]]+)\]\]', r'\2', val)
     val = re.sub(r'\[\[([^\]]+)\]\]', r'\1', val)
     return val.strip()
@@ -486,7 +687,6 @@ def strip_wikilinks_for_frontmatter(val: str) -> str:
 
 def build_frontmatter(title: str, category_label: str, url: str,
                       infobox_type: str = None, infobox_fields: dict = None) -> str:
-    """Build YAML frontmatter block."""
     safe_title = title.replace('"', '\\"')
     fm_lines = [
         '---',
@@ -503,7 +703,6 @@ def build_frontmatter(title: str, category_label: str, url: str,
     return '\n'.join(fm_lines)
 
 
-# Human-readable labels for infobox rows
 INFOBOX_ROW_LABELS = [
     ('type',        'Type'),
     ('region',      'Region'),
@@ -523,18 +722,14 @@ INFOBOX_ROW_LABELS = [
 ]
 
 
-def build_its_infobox(title: str, infobox_fields: dict) -> str:
-    """
-    Build an ITS Theme-compatible infobox callout from extracted infobox fields.
-    Format:
-        > [!infobox|right]+
-        > # Title
-        > ###### Details
-        > | | |
-        > |---|---|
-        > | **Type** | Settlement |
-        > | **Region** | [[Delimbiyr Vale]], [[Sword Coast]] |
-        ...
+def build_its_infobox(title: str, infobox_fields: dict,
+                      image_filename: str = None, include_images: bool = False,
+                      image_width: int = 0) -> str:
+    """Build an ITS Theme-compatible infobox callout.
+
+    When include_images=True and the infobox has an image field, the image
+    is embedded at the top of the callout from the Fandom CDN.
+    image_width > 0 caps the display width in pixels.
     """
     if not infobox_fields:
         return ''
@@ -548,18 +743,27 @@ def build_its_infobox(title: str, infobox_fields: dict) -> str:
                 rows.append(f'> | **{label}** | {val} |')
                 seen_keys.add(label)
 
-    if not rows:
+    if not rows and not (include_images and image_filename):
         return ''
 
-    callout_lines = [
-        '> [!infobox|right]+',
-        f'> # {title}',
-        '> ###### Details',
-        '> | | |',
-        '> |---|---|',
-    ] + rows
+    callout_lines = ['> [!infobox|right]+', f'> # {title}']
+
+    # Embed the infobox image if available and images are enabled.
+    # No width cap here — the ITS Theme callout CSS constrains the size.
+    if include_images and image_filename:
+        img_md = _make_image_md(image_filename, title, 0)
+        callout_lines.append(f'> {img_md}')
+        callout_lines.append('>')
+
+    if rows:
+        callout_lines += ['> ###### Details', '> | | |', '> |---|---|'] + rows
 
     return '\n'.join(callout_lines) + '\n\n'
+
+
+# ---------------------------------------------------------------------------
+# XML helpers
+# ---------------------------------------------------------------------------
 
 def detect_xml_namespace(xml_path: Path) -> str:
     with open(xml_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -571,15 +775,12 @@ def detect_xml_namespace(xml_path: Path) -> str:
 
 
 def build_redirect_map(xml_path: Path) -> dict:
-    """First pass: build and resolve redirect map."""
     print("Building redirect map (pass 1)...")
-    ns = detect_xml_namespace(xml_path)
-
+    ns          = detect_xml_namespace(xml_path)
     raw_redirects = {}
-    canonical = {}
-
-    context = ET.iterparse(xml_path, events=('end',))
-    redir_count = 0
+    canonical     = {}
+    context       = ET.iterparse(xml_path, events=('end',))
+    redir_count   = 0
 
     for event, elem in context:
         if elem.tag == f'{ns}page':
@@ -589,7 +790,6 @@ def build_redirect_map(xml_path: Path) -> dict:
                 title = (title_el.text or '').strip()
                 text  = (text_el.text  or '').strip()
                 norm  = normalise_title(title)
-
                 if text.lower().startswith('#redirect'):
                     m = re.search(r'#redirect[^\[]*\[\[([^\]#|]+)', text, re.IGNORECASE)
                     if m:
@@ -619,16 +819,14 @@ def build_redirect_map(xml_path: Path) -> dict:
     redirect_map = {}
     for source, target_norm in raw_redirects.items():
         resolved_norm = follow_chain(target_norm)
-        display_title = canonical.get(resolved_norm, resolved_norm.title())
-        redirect_map[source] = display_title
+        redirect_map[source] = canonical.get(resolved_norm, resolved_norm.title())
 
     print(f"  Redirect map ready ({len(redirect_map):,} entries).\n")
     return redirect_map
 
 
 def iter_articles(xml_path: Path):
-    """Yield (title, wikitext) for real lore articles only."""
-    ns = detect_xml_namespace(xml_path)
+    ns      = detect_xml_namespace(xml_path)
     context = ET.iterparse(xml_path, events=('end',))
     for event, elem in context:
         if elem.tag == f'{ns}page':
@@ -645,11 +843,10 @@ def iter_articles(xml_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Map-mode helpers
 # ---------------------------------------------------------------------------
 
 def load_map_seeds(json_path: Path) -> set:
-    """Extract pin link names from an Obsidian map markers JSON file."""
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     seeds = set()
@@ -660,30 +857,13 @@ def load_map_seeds(json_path: Path) -> set:
     return seeds
 
 
-def build_article_allowlist(xml_path: Path, seeds: set,
-                             redirect_map: dict) -> set:
-    """
-    Build the set of article titles to include using graph traversal.
-
-    Strategy:
-    - Start with the map pin names as seeds
-    - Follow ALL wikilinks from place articles (Location/Building/Road infoboxes)
-    - From non-place articles, do NOT follow further links (they act as leaf nodes)
-    - This keeps the vault geographically focused while including directly
-      referenced characters, deities, organisations etc.
-    """
+def build_article_allowlist(xml_path: Path, seeds: set, redirect_map: dict) -> tuple:
     print("Building article allowlist from map pins...")
-
-    ns = detect_xml_namespace(xml_path)
-
-    # Build full index: normalised_title -> (canonical_title, wikitext, is_place)
-    print("  Indexing all articles...")
-    index = {}       # norm -> (canonical, wikitext, is_place)
-    redir = {}       # norm -> norm target
-
-    PLACE_IBOX_SET = PLACE_INFOBOX_NAMES  # reuse existing set
-
+    ns      = detect_xml_namespace(xml_path)
+    index   = {}
+    redir   = {}
     context = ET.iterparse(xml_path, events=('end',))
+
     for event, elem in context:
         if elem.tag == f'{ns}page':
             title_el = elem.find(f'{ns}title')
@@ -692,21 +872,15 @@ def build_article_allowlist(xml_path: Path, seeds: set,
                 title = (title_el.text or '').strip()
                 text  = (text_el.text  or '').strip()
                 norm  = normalise_title(title)
-
-                # Skip meta namespaces
                 if any(title.startswith(p) for p in SKIP_PREFIXES):
                     elem.clear()
                     continue
-
                 if text.lower().startswith('#redirect'):
                     m = re.search(r'#redirect[^\[]*\[\[([^\]#|]+)', text, re.IGNORECASE)
                     if m:
                         redir[norm] = normalise_title(m.group(1))
                 elif text:
-                    # Detect if this is a place article
-                    ibox_pat = r'\{\{(' + '|'.join(
-                        re.escape(n) for n in PLACE_IBOX_SET
-                    ) + r')\s*[\n\r|]'
+                    ibox_pat = r'\{\{(' + '|'.join(re.escape(n) for n in PLACE_INFOBOX_NAMES) + r')\s*[\n\r|]'
                     is_place = bool(re.search(ibox_pat, text, re.IGNORECASE))
                     index[norm] = (title, text, is_place)
             elem.clear()
@@ -714,7 +888,7 @@ def build_article_allowlist(xml_path: Path, seeds: set,
     print(f"  Indexed {len(index):,} articles, {len(redir):,} redirects")
 
     def resolve_norm(name: str) -> str:
-        norm = normalise_title(name)
+        norm    = normalise_title(name)
         visited = {norm}
         for _ in range(10):
             if norm in redir:
@@ -728,34 +902,19 @@ def build_article_allowlist(xml_path: Path, seeds: set,
         return norm
 
     def get_links(text: str) -> set:
-        links = set()
-        for m in re.finditer(r'\[\[([^\]|#]+)', text):
-            links.add(m.group(1).strip())
-        return links
+        return {m.group(1).strip() for m in re.finditer(r'\[\[([^\]|#]+)', text)}
 
-    # Seed the queue with map pins
-    queue = []
-    for seed in seeds:
-        norm = resolve_norm(seed)
-        if norm in index:
-            queue.append(norm)
-
+    queue     = [resolve_norm(s) for s in seeds if resolve_norm(s) in index]
     print(f"  {len(queue)} of {len(seeds)} pins matched articles in XML")
 
-    # BFS: follow links from place articles only
     allowlist = set()
-    to_visit = list(queue)
-
+    to_visit  = list(queue)
     while to_visit:
         norm = to_visit.pop()
-        if norm in allowlist:
-            continue
-        if norm not in index:
+        if norm in allowlist or norm not in index:
             continue
         allowlist.add(norm)
-        canonical, text, is_place = index[norm]
-
-        # Only follow outgoing links from place articles
+        _, text, is_place = index[norm]
         if is_place:
             for link in get_links(text):
                 target = resolve_norm(link)
@@ -766,15 +925,25 @@ def build_article_allowlist(xml_path: Path, seeds: set,
     return allowlist, index
 
 
-def process(xml_path: Path, output_dir: Path, json_path: Path = None):
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
+
+def process(xml_path: Path, output_dir: Path, json_path: Path = None,
+            include_images: bool = False, image_width: int = 0):
     print(f"Input:  {xml_path}")
-    print(f"Output: {output_dir}\n")
+    print(f"Output: {output_dir}")
+    if include_images:
+        width_note = f" (max width: {image_width}px)" if image_width else ""
+        print(f"Images: enabled{width_note}")
+    else:
+        print("Images: disabled  (use --images to enable)")
+    print()
 
-    redirect_map = build_redirect_map(xml_path)
-
-    # If a JSON map file was provided, build the allowlist
-    allowlist = None
+    redirect_map  = build_redirect_map(xml_path)
+    allowlist     = None
     article_index = None
+
     if json_path:
         seeds = load_map_seeds(json_path)
         allowlist, article_index = build_article_allowlist(xml_path, seeds, redirect_map)
@@ -790,7 +959,6 @@ def process(xml_path: Path, output_dir: Path, json_path: Path = None):
     output_dir.mkdir(parents=True, exist_ok=True)
     stats = {'written': 0, 'skipped': 0, 'links_resolved': 0}
 
-    # Use allowlist-based iterator or full iterator
     if allowlist is not None and article_index is not None:
         def iter_allowed():
             for norm, (canonical, wikitext, _) in article_index.items():
@@ -806,21 +974,23 @@ def process(xml_path: Path, output_dir: Path, json_path: Path = None):
 
     for title, wikitext in iterator:
         try:
-            # Extract place infobox BEFORE template removal
             infobox_type, infobox_fields = extract_infobox(wikitext)
 
-            # Strip infobox from wikitext (data already extracted above)
-            wikitext_clean = strip_place_infoboxes(wikitext)
-            # Convert wikitext -> markdown
-            body = convert_wikitext_to_markdown(wikitext_clean)
+            # Grab the image filename for the callout header (if images enabled)
+            image_filename = infobox_fields.get('image', '').strip() if infobox_fields else ''
 
-            # Resolve redirect links
+            wikitext_clean = strip_place_infoboxes(wikitext)
+            body = convert_wikitext_to_markdown(
+                wikitext_clean,
+                include_images=include_images,
+                image_width=image_width,
+            )
+
             before = body
-            body = resolve_wikilinks(body, redirect_map)
+            body   = resolve_wikilinks(body, redirect_map)
             if body != before:
                 stats['links_resolved'] += 1
 
-            # If body empty but infobox data exists, synthesise a summary
             if not body.strip() and infobox_fields:
                 parts = []
                 for fkey, label in [('type', 'Type'), ('region', 'Region'), ('size', 'Size'),
@@ -836,21 +1006,17 @@ def process(xml_path: Path, output_dir: Path, json_path: Path = None):
                 stats['skipped'] += 1
                 continue
 
-            # Detect category
-            subfolder, category_label = detect_category(
-                title, body, infobox_type, infobox_fields
-            )
+            subfolder, category_label = detect_category(title, body, infobox_type, infobox_fields)
+            url         = BASE_URL + slugify_url(title)
+            frontmatter = build_frontmatter(title, category_label, url, infobox_type, infobox_fields)
+            its_infobox = build_its_infobox(
+                title, infobox_fields,
+                image_filename=image_filename,
+                include_images=include_images,
+                image_width=image_width,
+            ) if infobox_fields else ''
 
-            # Build note
-            url = BASE_URL + slugify_url(title)
-            frontmatter = build_frontmatter(
-                title, category_label, url, infobox_type, infobox_fields
-            )
-            # Build ITS infobox callout if we have place data
-            its_infobox = build_its_infobox(title, infobox_fields) if infobox_fields else ''
-            note = frontmatter + f'# {title}\n\n' + its_infobox + body + '\n'
-
-            # Write file
+            note     = frontmatter + f'# {title}\n\n' + its_infobox + body + '\n'
             note_dir = output_dir / subfolder
             note_dir.mkdir(parents=True, exist_ok=True)
             filename = sanitize_filename(title) + '.md'
@@ -858,7 +1024,7 @@ def process(xml_path: Path, output_dir: Path, json_path: Path = None):
 
             if out_path.exists():
                 counter = 1
-                stem = sanitize_filename(title)
+                stem    = sanitize_filename(title)
                 while out_path.exists():
                     out_path = note_dir / f'{stem}_{counter}.md'
                     counter += 1
@@ -874,55 +1040,40 @@ def process(xml_path: Path, output_dir: Path, json_path: Path = None):
             else:
                 print(msg)
 
-    # Post-process: convert broken links to plain text
     fix_broken_links(output_dir)
-
     return stats
 
 
 def fix_broken_links(output_dir: Path) -> dict:
-    """
-    Post-processing pass: scan all notes for [[wikilinks]] that point to
-    notes that don't exist in the vault, and convert them to plain text.
-
-    [[Missing Page]]          -> Missing Page
-    [[Missing Page|Display]]  -> Display
-    [[Existing Page]]         -> [[Existing Page]]  (unchanged)
-    """
+    """Scan all notes and convert broken [[wikilinks]] to plain text."""
     print("\nFixing broken links...")
-
-    # Single pass: collect all files, build index, then fix
-    all_files = list(output_dir.rglob('*.md'))
-    existing = {md.stem.lower() for md in all_files}
+    all_files    = list(output_dir.rglob('*.md'))
+    existing     = {md.stem.lower() for md in all_files}
     print(f"  Scanning {len(all_files):,} notes...")
-
     link_pattern = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
-    stats = {'notes_fixed': 0, 'links_fixed': 0}
+    stats        = {'notes_fixed': 0, 'links_fixed': 0}
 
     for md in all_files:
         original = md.read_text(encoding='utf-8')
-        fixed = original
-        changed = False
 
         def replace_link(m):
             page    = m.group(1).strip()
             display = m.group(2).strip() if m.group(2) else None
-            # Use sanitize_link_target so [[Waterdeep/Dock Ward]] -> 'waterdeep-dock ward'
-            safe = sanitize_link_target(page)
+            safe    = sanitize_link_target(page)
             if safe.lower() in existing:
-                return m.group(0)  # link is valid — leave it alone
-            # Broken link — return plain text
+                return m.group(0)
             return display if display else page
 
-        new_content = link_pattern.sub(replace_link, fixed)
+        new_content = link_pattern.sub(replace_link, original)
         if new_content != original:
             md.write_text(new_content, encoding='utf-8')
             stats['notes_fixed'] += 1
-            # Count how many links were fixed in this note
-            stats['links_fixed'] += len(link_pattern.findall(original)) - len(link_pattern.findall(new_content))
+            stats['links_fixed'] += (
+                len(link_pattern.findall(original)) -
+                len(link_pattern.findall(new_content))
+            )
 
     print(f"  Fixed {stats['links_fixed']:,} broken links across {stats['notes_fixed']:,} notes")
-
     return stats
 
 
@@ -947,16 +1098,34 @@ def print_summary(output_dir: Path, stats: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Convert FR Wiki XML dump to Obsidian vault.'
+        description='Convert FR Wiki XML dump to Obsidian vault.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full vault, no images (default)
+  python fr_to_obsidian.py --input dump.xml --output FR-Vault
+
+  # Map-focused vault (Sword Coast etc.)
+  python fr_to_obsidian.py --input dump.xml --output FR-Vault --json map.json
+
+  # Full vault WITH images from Fandom CDN
+  python fr_to_obsidian.py --input dump.xml --output FR-Vault --images
+
+  # Map-focused vault with images capped at 400 px wide
+  python fr_to_obsidian.py --input dump.xml --output FR-Vault --json map.json --images --image-width 400
+        """,
     )
     parser.add_argument('--input',  '-i', required=True,
                         help='Path to forgottenrealms_pages_current.xml')
     parser.add_argument('--output', '-o', default='./FR-Vault',
                         help='Output directory (default: ./FR-Vault)')
-    parser.add_argument('--json', '-j', default=None,
-                        help='Path to Obsidian map markers JSON file. '
-                             'If provided, only extracts articles linked '
-                             'from map pins and the places they link to.')
+    parser.add_argument('--json',   '-j', default=None,
+                        help='Obsidian map markers JSON — enables map-focused mode')
+    parser.add_argument('--images', action='store_true', default=False,
+                        help='Embed images from the Fandom CDN (default: off)')
+    parser.add_argument('--image-width', type=int, default=0, metavar='PX',
+                        help='Cap image display width in pixels, e.g. 400. '
+                             'Only applies when --images is set. 0 = no cap (default).')
     args = parser.parse_args()
 
     xml_path   = Path(args.input)
@@ -971,7 +1140,14 @@ def main():
         print(f"ERROR: JSON file not found: {json_path}")
         return
 
-    stats = process(xml_path, output_dir, json_path)
+    if args.image_width and not args.images:
+        print("NOTE: --image-width has no effect without --images. Continuing without images.")
+
+    stats = process(
+        xml_path, output_dir, json_path,
+        include_images=args.images,
+        image_width=args.image_width if args.images else 0,
+    )
     print_summary(output_dir, stats)
 
 
